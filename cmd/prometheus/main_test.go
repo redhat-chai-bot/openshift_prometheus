@@ -1576,3 +1576,120 @@ func TestFeatureFlagsDocumented(t *testing.T) {
 	require.True(t, slices.IsSorted(helpFlags))
 	require.ElementsMatch(t, helpFlags, docFlags)
 }
+
+// TestFileSDMtimeMetricAfterShrinkingGroups verifies that
+// prometheus_sd_file_mtime_seconds is preserved when a target file is rewritten
+// with fewer target groups. The file still exists, so its mtime metric must
+// remain. This reproduces the bug described in
+// https://github.com/prometheus/prometheus/issues/20593.
+func TestFileSDMtimeMetricAfterShrinkingGroups(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "prometheus.yml")
+	targetFile := filepath.Join(tmpDir, "targets.json")
+
+	port := testutil.RandomUnprivilegedPort(t)
+
+	// Write a target file with two target groups.
+	twoGroups := `[
+  {"targets": ["localhost:9999"], "labels": {"group": "one"}},
+  {"targets": ["localhost:9998"], "labels": {"group": "two"}}
+]`
+	require.NoError(t, os.WriteFile(targetFile, []byte(twoGroups), 0o644))
+
+	// Use a very long refresh_interval (300s) so that file SD relies on
+	// fsnotify for detecting changes. When the file is rewritten with fewer
+	// groups, fsnotify triggers exactly one refresh. The bug deletes the mtime
+	// metric during that refresh, and the long interval ensures no timer-based
+	// refresh restores it before we check.
+	config := fmt.Sprintf(`
+scrape_configs:
+  - job_name: 'filesd'
+    file_sd_configs:
+      - files:
+          - '%s'
+        refresh_interval: 300s
+`, targetFile)
+	require.NoError(t, os.WriteFile(configFile, []byte(config), 0o644))
+
+	prom := prometheusCommandWithLogging(
+		t,
+		configFile,
+		port,
+		"--storage.tsdb.path="+filepath.Join(tmpDir, "data"),
+	)
+	require.NoError(t, prom.Start())
+
+	waitForPrometheusReady(t, port)
+
+	const mtimeMetric = "prometheus_sd_file_mtime_seconds"
+
+	fetchMetrics := func() ([]byte, error) {
+		r, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Body.Close()
+		return io.ReadAll(r.Body)
+	}
+
+	hasMtimeMetric := func(body []byte) bool {
+		_, err := getMetricValue(t, bytes.NewReader(body), model.MetricTypeGauge, mtimeMetric)
+		return err == nil
+	}
+
+	scanCount := func(body []byte) uint64 {
+		p := expfmt.NewTextParser(model.UTF8Validation)
+		families, err := p.TextToMetricFamilies(bytes.NewReader(body))
+		if err != nil {
+			return 0
+		}
+		mf, ok := families["prometheus_sd_file_scan_duration_seconds"]
+		if !ok || len(mf.GetMetric()) == 0 {
+			return 0
+		}
+		return mf.GetMetric()[0].GetSummary().GetSampleCount()
+	}
+
+	// Wait for the initial file SD scan to report the mtime metric.
+	require.Eventually(t, func() bool {
+		body, err := fetchMetrics()
+		if err != nil {
+			return false
+		}
+		return hasMtimeMetric(body)
+	}, readyTimeout, 500*time.Millisecond, "mtime metric never appeared with two target groups")
+
+	// Record the scan count before the shrink so we can wait for the
+	// fsnotify-triggered refresh to complete.
+	body, err := fetchMetrics()
+	require.NoError(t, err)
+	scanCountBefore := scanCount(body)
+
+	// Shrink the target file to one group.
+	oneGroup := `[
+  {"targets": ["localhost:9999"], "labels": {"group": "one"}}
+]`
+	require.NoError(t, os.WriteFile(targetFile, []byte(oneGroup), 0o644))
+
+	// Wait for file SD to detect the change (via fsnotify) and complete a
+	// new scan. The scan count must increase by at least one.
+	require.Eventually(t, func() bool {
+		body, err := fetchMetrics()
+		if err != nil {
+			return false
+		}
+		return scanCount(body) > scanCountBefore
+	}, 10*time.Second, 200*time.Millisecond, "file SD did not rescan after file change")
+
+	// The mtime metric must still be present because the file still exists.
+	body, err = fetchMetrics()
+	require.NoError(t, err, "failed to fetch /metrics after shrinking target groups")
+	require.True(t, hasMtimeMetric(body),
+		"prometheus_sd_file_mtime_seconds disappeared after shrinking target groups; "+
+			"the file still exists and its mtime metric should be preserved")
+}
