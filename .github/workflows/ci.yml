@@ -30,7 +30,7 @@ jobs:
 
   test_go_more:
     name: More Go tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     container:
       image: quay.io/prometheus/golang-builder:1.25-base
     steps:
